@@ -1,0 +1,2121 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>千人即時點名與單位區域戰情系統 (支援名牌QR掃碼版)</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- 引入 QR Code 相機掃描核心套件 -->
+  <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen font-sans pb-24">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // ==========================================
+    // 1. 系統設定區 (已綁定你的 Firebase 與 Google Apps Script 網址)
+    // ==========================================
+    const CONFIG = {
+      FIREBASE_DB_URL: "https://ikt-1000-default-rtdb.asia-southeast1.firebasedatabase.app",
+      EVENT_ID: "CHECKIN_2026_MAIN",
+      ADMIN_PIN: "8888", // 修改既有紀錄、匯入名單、清空紀錄之管理員密碼
+      GAS_SYNC_URL: "https://script.google.com/macros/s/AKfycbzCXzWVrY7ztsmyf-NBOZ_fzDv45ijg63I6IP8VuEwVgxWSxaDahZ7xMWmmax8xEmOKFg/exec",
+    };
+
+    const LEAVE_REASONS = ["事假", "病假", "公假", "晚到", "自行填寫"];
+
+    // 自動組合唯一鍵（與 GAS 的 makeRecordKey 完全一致：性別_編號）
+    const makeRecordKey = (gender, code, name, fallbackIdx) => {
+      const g = String(gender || "").trim();
+      const c = String(code || "").trim();
+      const n = String(name || "").trim();
+      if (c) return `${g}_${c}`;
+      return `${g}_${n}_${fallbackIdx}`;
+    };
+
+    // 內建 Web Audio API 提示音效（免外部音檔，離線也能發出清脆嗶聲）
+    const playBeepSound = (type = "success") => {
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        if (!AudioCtx) return;
+        const ctx = new AudioCtx();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        if (type === "success") {
+          // 成功：清脆高音單響
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(880, ctx.currentTime);
+          osc.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + 0.12);
+          gain.gain.setValueAtTime(0.25, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.18);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.18);
+        } else if (type === "duplicate") {
+          // 重複掃描：中低音提示
+          osc.type = "triangle";
+          osc.frequency.setValueAtTime(440, ctx.currentTime);
+          gain.gain.setValueAtTime(0.2, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.25);
+        } else {
+          // 錯誤：低音警告
+          osc.type = "sawtooth";
+          osc.frequency.setValueAtTime(220, ctx.currentTime);
+          gain.gain.setValueAtTime(0.25, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.35);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.35);
+        }
+      } catch (e) {}
+    };
+
+    // 智慧型自然數字排序器
+    const naturalCollator = new Intl.Collator("zh-Hant", { numeric: true, sensitivity: "base" });
+    const sortByNumberAsc = (aStr = "", bStr = "") => {
+      const sA = String(aStr).trim();
+      const sB = String(bStr).trim();
+      const numA = sA.match(/\d+/);
+      const numB = sB.match(/\d+/);
+      if (numA && numB && Number(numA[0]) !== Number(numB[0])) {
+        return Number(numA[0]) - Number(numB[0]);
+      }
+      return naturalCollator.compare(sA, sB);
+    };
+
+    // 預設測試名單
+    const generateDefaultRoster = () => {
+      const unitRegions = {
+        "中和": ["044區", "015區", "001區"],
+        "正和": ["030區", "015區", "001區"],
+        "崇正": ["025區", "005區", "012區"],
+        "明善": ["040區", "008區", "020區"]
+      };
+      const units = Object.keys(unitRegions);
+      const genders = ["乾", "坤"];
+      const roster = [
+        { memberId: "坤_001", gender: "坤", code: "001", name: "簡薇瑄", unit: "中和", region: "044區" }
+      ];
+
+      for (let i = 2; i <= 50; i++) {
+        const unit = units[i % units.length];
+        const regions = unitRegions[unit];
+        const region = regions[i % regions.length];
+        const gender = genders[i % 2];
+        const code = String(i).padStart(3, "0");
+        const name = `道親_${i}`;
+        roster.push({
+          memberId: makeRecordKey(gender, code, name, i),
+          gender,
+          code,
+          name,
+          unit,
+          region
+        });
+      }
+      return roster;
+    };
+
+    const isMaleGender = (g) => ["乾", "乾道", "男", "M", "male", "童"].includes(String(g).trim());
+    const isFemaleGender = (g) => ["坤", "坤道", "女", "F", "female"].includes(String(g).trim());
+
+    function App() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const isCheckinOnly = urlParams.get("mode") === "checkin";
+
+      const [view, setView] = useState(isCheckinOnly ? "checkin" : "dashboard");
+
+      const [isAdminUnlocked, setIsAdminUnlocked] = useState(() => {
+        return sessionStorage.getItem("ADMIN_UNLOCKED") === "true";
+      });
+      const [pinModalOpen, setPinModalOpen] = useState(false);
+      const [pinInput, setPinInput] = useState("");
+      const pendingActionRef = useRef(null);
+
+      const [editTargetMember, setEditTargetMember] = useState(null);
+      const [editLeaveType, setEditLeaveType] = useState("事假");
+      const [editLeaveNote, setEditLeaveNote] = useState("");
+
+      const [leaveModal, setLeaveModal] = useState(null);
+      const [leaveTypeInput, setLeaveTypeInput] = useState("事假");
+      const [leaveCustomNote, setLeaveCustomNote] = useState("");
+
+      const [roster, setRoster] = useState(() => {
+        const saved = localStorage.getItem(`ROSTER_5COL_${CONFIG.EVENT_ID}`);
+        return saved ? JSON.parse(saved) : generateDefaultRoster();
+      });
+      const [rosterSyncStatus, setRosterSyncStatus] = useState("連線 ikt-1000 中...");
+
+      const [checkins, setCheckins] = useState(() => {
+        const saved = localStorage.getItem(`CHECKINS_5COL_${CONFIG.EVENT_ID}`);
+        return saved ? JSON.parse(saved) : {};
+      });
+
+      // 簽到端分頁: 'qr' (名牌QR掃碼) | 'zone' (依單位區域點名) | 'search' (關鍵字搜尋)
+      const [checkinTab, setCheckinTab] = useState("qr");
+      const [checkinUnit, setCheckinUnit] = useState("");
+      const [checkinRegion, setCheckinRegion] = useState("");
+      const [checkinSearchFilter, setCheckinSearchFilter] = useState("");
+
+      // QR 掃碼器狀態
+      const [isCameraActive, setIsCameraActive] = useState(false);
+      const [cameraError, setCameraError] = useState("");
+      const [scanResultBanner, setScanResultBanner] = useState(null); // { type: 'success' | 'duplicate' | 'error' | 'ambiguous', title, detail, candidates? }
+      const [recentScans, setRecentScans] = useState([]);
+      const [gunInput, setGunInput] = useState("");
+      const lastScanRef = useRef({ text: "", time: 0 });
+      const rosterRef = useRef(roster);
+      const checkinsRef = useRef(checkins);
+
+      // 保持最新 ref 供相機回呼函式讀取，避免閉包抓到舊狀態
+      useEffect(() => { rosterRef.current = roster; }, [roster]);
+      useEffect(() => { checkinsRef.current = checkins; }, [checkins]);
+
+      const [draftBatch, setDraftBatch] = useState({});
+      const [batchConfirmModalOpen, setBatchConfirmModalOpen] = useState(false);
+      const [isSubmittingBatch, setIsSubmittingBatch] = useState(false);
+      const [singleConfirmPresentId, setSingleConfirmPresentId] = useState(null);
+      const [queryInput, setQueryInput] = useState("");
+
+      const [selectedUnit, setSelectedUnit] = useState("ALL");
+      const [selectedRegion, setSelectedRegion] = useState("ALL");
+      const [genderFilter, setGenderFilter] = useState("ALL");
+      const [statusFilter, setStatusFilter] = useState("ALL");
+      const [searchKeyword, setSearchKeyword] = useState("");
+      const [isUploadingRoster, setIsUploadingRoster] = useState(false);
+      const [isSyncingSheet, setIsSyncingSheet] = useState(false);
+
+      const fileInputRef = useRef(null);
+
+      useEffect(() => {
+        if (!singleConfirmPresentId) return;
+        const timer = setTimeout(() => setSingleConfirmPresentId(null), 3500);
+        return () => clearTimeout(timer);
+      }, [singleConfirmPresentId]);
+
+      useEffect(() => {
+        setDraftBatch({});
+        setSingleConfirmPresentId(null);
+      }, [checkinUnit, checkinRegion]);
+
+      const requireAdmin = (actionCallback) => {
+        if (isAdminUnlocked) {
+          actionCallback();
+        } else {
+          pendingActionRef.current = actionCallback;
+          setPinInput("");
+          setPinModalOpen(true);
+        }
+      };
+
+      const handleVerifyPin = (e) => {
+        e.preventDefault();
+        if (pinInput.trim() === CONFIG.ADMIN_PIN) {
+          setIsAdminUnlocked(true);
+          sessionStorage.setItem("ADMIN_UNLOCKED", "true");
+          setPinModalOpen(false);
+          if (pendingActionRef.current) {
+            const act = pendingActionRef.current;
+            pendingActionRef.current = null;
+            act();
+          }
+        } else {
+          alert("❌ 管理員密碼錯誤！");
+          setPinInput("");
+        }
+      };
+
+      const handleLockAdmin = () => {
+        setIsAdminUnlocked(false);
+        sessionStorage.removeItem("ADMIN_UNLOCKED");
+      };
+
+      // 連線 ikt-1000 Firebase 拉取雲端名單與即時監聽
+      useEffect(() => {
+        if (!CONFIG.FIREBASE_DB_URL) return;
+
+        const rosterUrl = `${CONFIG.FIREBASE_DB_URL}/rosters/${CONFIG.EVENT_ID}.json`;
+        fetch(rosterUrl)
+          .then(r => r.json())
+          .then(cloudRoster => {
+            if (Array.isArray(cloudRoster) && cloudRoster.length > 0) {
+              const normalized = cloudRoster.map((p, idx) => ({
+                ...p,
+                memberId: p.memberId || makeRecordKey(p.gender, p.code, p.name, idx + 1)
+              }));
+              setRoster(normalized);
+              localStorage.setItem(`ROSTER_5COL_${CONFIG.EVENT_ID}`, JSON.stringify(normalized));
+              setRosterSyncStatus(`已同步雲端名單 (${normalized.length}人)`);
+            } else {
+              setRosterSyncStatus("雲端尚無名單 (請從試算表推送或匯入CSV)");
+            }
+          })
+          .catch(() => setRosterSyncStatus("使用本地快取名單"));
+
+        const checkinsUrl = `${CONFIG.FIREBASE_DB_URL}/checkins/${CONFIG.EVENT_ID}.json`;
+        const es = new EventSource(checkinsUrl);
+
+        fetch(checkinsUrl)
+          .then(r => r.json())
+          .then(data => { setCheckins(data || {}); })
+          .catch(err => console.error("簽到初始載入失敗:", err));
+
+        es.addEventListener("put", (e) => {
+          const payload = JSON.parse(e.data);
+          if (payload.path === "/") {
+            setCheckins(payload.data || {});
+          } else {
+            const recordKey = decodeURIComponent(payload.path.replace("/", ""));
+            if (payload.data === null) {
+              setCheckins(prev => {
+                const next = { ...prev };
+                delete next[recordKey];
+                return next;
+              });
+            } else {
+              setCheckins(prev => ({ ...prev, [recordKey]: payload.data }));
+            }
+          }
+        });
+
+        es.addEventListener("patch", (e) => {
+          const payload = JSON.parse(e.data);
+          if (payload.path === "/" && payload.data) {
+            setCheckins(prev => ({ ...prev, ...payload.data }));
+          }
+        });
+
+        return () => es.close();
+      }, []);
+
+      useEffect(() => {
+        localStorage.setItem(`CHECKINS_5COL_${CONFIG.EVENT_ID}`, JSON.stringify(checkins));
+      }, [checkins]);
+
+      const submitSingleRecord = async (recordKey, payloadObj) => {
+        const record = { ...payloadObj, time: Date.now() };
+        setCheckins(prev => ({ ...prev, [recordKey]: record }));
+        setSingleConfirmPresentId(null);
+
+        setDraftBatch(prev => {
+          if (!prev[recordKey]) return prev;
+          const next = { ...prev };
+          delete next[recordKey];
+          return next;
+        });
+
+        if (!CONFIG.FIREBASE_DB_URL) return record;
+
+        const endpoint = `${CONFIG.FIREBASE_DB_URL}/checkins/${CONFIG.EVENT_ID}/${encodeURIComponent(recordKey)}.json`;
+        let delay = 600;
+        for (let attempt = 1; attempt <= 4; attempt++) {
+          try {
+            const res = await fetch(endpoint, {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(record)
+            });
+            if (res.ok) return record;
+          } catch (err) {
+            console.warn(`重試第 ${attempt} 次...`);
+          }
+          await new Promise(r => setTimeout(r, delay + Math.random() * 300));
+          delay *= 2;
+        }
+      };
+
+      // ==========================================
+      // 名牌 QR Code 解析與自動點名核心
+      // 支援格式：{"scanMember":true,"prayer":"簡薇瑄","seatNo":"001","memberId":"TWCC000120160","temple":"中和044區","className":"全球壇主二班","gender":"坤"}
+      // ==========================================
+      const handleScannedQRText = async (rawText) => {
+        const cleanText = String(rawText || "").trim();
+        if (!cleanText) return;
+
+        // 防止鏡頭對準同一張名牌在 2.5 秒內連續觸發
+        const now = Date.now();
+        if (lastScanRef.current.text === cleanText && now - lastScanRef.current.time < 2500) {
+          return;
+        }
+        lastScanRef.current = { text: cleanText, time: now };
+
+        const currentRoster = rosterRef.current;
+        const currentCheckins = checkinsRef.current;
+        let matchedList = [];
+        let parsedLabel = cleanText;
+
+        try {
+          const obj = JSON.parse(cleanText);
+          if (obj && typeof obj === "object") {
+            const qGender = String(obj.gender || "").trim();
+            const qCode = String(obj.seatNo || obj.code || "").trim();
+            const qName = String(obj.prayer || obj.name || "").trim();
+            const qTemple = String(obj.temple || "").trim();
+
+            parsedLabel = `${qName || "未知"} (${qGender} / ${qCode}) ${qTemple}`;
+
+            // 1. 最精準比對：性別 + 編號 + 求道名
+            matchedList = currentRoster.filter(p =>
+              (!qGender || p.gender === qGender) &&
+              (!qCode || p.code === qCode) &&
+              (!qName || p.name === qName)
+            );
+
+            // 若有多個單位有相同性別+編號+姓名，利用 temple (如 "中和044區") 過濾
+            if (matchedList.length > 1 && qTemple) {
+              const filteredByTemple = matchedList.filter(p =>
+                qTemple.includes(p.unit) || qTemple.includes(p.region)
+              );
+              if (filteredByTemple.length > 0) matchedList = filteredByTemple;
+            }
+
+            // 2. 次佳比對（防止名牌與試算表姓名微幅差異）：性別 + 編號 (+ temple)
+            if (matchedList.length === 0 && qCode) {
+              const byCode = currentRoster.filter(p =>
+                (!qGender || p.gender === qGender) && p.code === qCode
+              );
+              if (byCode.length > 1 && qTemple) {
+                const byTemple = byCode.filter(p =>
+                  qTemple.includes(p.unit) || qTemple.includes(p.region)
+                );
+                matchedList = byTemple.length > 0 ? byTemple : byCode;
+              } else {
+                matchedList = byCode;
+              }
+            }
+
+            // 3. 第三比對：求道名 + 性別
+            if (matchedList.length === 0 && qName) {
+              matchedList = currentRoster.filter(p =>
+                p.name === qName && (!qGender || p.gender === qGender)
+              );
+            }
+          }
+        } catch (err) {
+          // 若非 JSON 格式，支援純文字編號或求道名
+          matchedList = currentRoster.filter(p => p.code === cleanText || p.name === cleanText);
+        }
+
+        // 查無此人
+        if (matchedList.length === 0) {
+          playBeepSound("error");
+          setScanResultBanner({
+            type: "error",
+            title: "❌ 名單內查無此人員",
+            detail: `掃描內容：${parsedLabel}`
+          });
+          return;
+        }
+
+        // 若仍有多筆同名同號無法自動區分，跳出選擇鈕
+        if (matchedList.length > 1) {
+          playBeepSound("duplicate");
+          setScanResultBanner({
+            type: "ambiguous",
+            title: "⚠️ 發現多位相同編號/姓名，請點選確認：",
+            detail: parsedLabel,
+            candidates: matchedList
+          });
+          return;
+        }
+
+        // 精準命中唯一人員！
+        const person = matchedList[0];
+        const existing = currentCheckins[person.memberId];
+
+        if (existing) {
+          // 已有紀錄（已簽到或已請假）-> 鎖定保護不覆蓋
+          playBeepSound("duplicate");
+          const statusDesc =
+            existing.status === "present"
+              ? `已於 ${new Date(existing.time).toLocaleTimeString("zh-TW", { hour12: false })} 完成簽到`
+              : `已登記【${existing.leaveType || "請假"}】${existing.leaveNote ? `(${existing.leaveNote})` : ""}`;
+          setScanResultBanner({
+            type: "duplicate",
+            title: `⚠️ 已登記過（狀態已鎖定）：${person.name}`,
+            detail: `${person.unit} ／ ${person.region} ／ ${person.gender} ${person.code} — ${statusDesc}`
+          });
+          return;
+        }
+
+        // 首次掃描 -> 立即完成簽到！
+        playBeepSound("success");
+        await submitSingleRecord(person.memberId, { status: "present", method: "qr" });
+
+        const timeStr = new Date().toLocaleTimeString("zh-TW", { hour12: false });
+        setScanResultBanner({
+          type: "success",
+          title: `✅ 報到成功：${person.name}`,
+          detail: `${person.unit} ／ ${person.region} ／ ${person.gender}道 編號 ${person.code}（${timeStr}）`
+        });
+        setRecentScans(prev => [
+          { ...person, timeStr },
+          ...prev.filter(x => x.memberId !== person.memberId).slice(0, 14)
+        ]);
+      };
+
+      // 啟動與關閉手機相機 QR Code 掃描器
+      useEffect(() => {
+        if (view !== "checkin" || checkinTab !== "qr" || !isCameraActive) {
+          return;
+        }
+
+        let html5QrCode = null;
+        let isMounted = true;
+
+        const startScanner = async () => {
+          setCameraError("");
+          try {
+            html5QrCode = new Html5Qrcode("qr-reader-box");
+            await html5QrCode.start(
+              { facingMode: "environment" },
+              {
+                fps: 12,
+                qrbox: { width: 240, height: 240 },
+                aspectRatio: 1.0
+              },
+              (decodedText) => {
+                if (isMounted) handleScannedQRText(decodedText);
+              },
+              () => {}
+            );
+          } catch (err) {
+            if (isMounted) {
+              setCameraError("無法開啟相機：請確認網址為 https:// 開頭，並允許瀏覽器使用相機權限。");
+              setIsCameraActive(false);
+            }
+          }
+        };
+
+        startScanner();
+
+        return () => {
+          isMounted = false;
+          if (html5QrCode) {
+            html5QrCode.stop().then(() => html5QrCode.clear()).catch(() => {});
+          }
+        };
+      }, [view, checkinTab, isCameraActive]);
+
+      const submitBatchCheckins = async () => {
+        const entries = Object.entries(draftBatch);
+        if (entries.length === 0) return;
+
+        setIsSubmittingBatch(true);
+        const now = Date.now();
+        const patchPayload = {};
+        entries.forEach(([recordKey, item]) => {
+          if (!checkins[recordKey]) {
+            patchPayload[recordKey] = {
+              status: item.status,
+              ...(item.leaveType ? { leaveType: item.leaveType } : {}),
+              ...(item.leaveNote ? { leaveNote: item.leaveNote } : {}),
+              time: now,
+              method: "batch"
+            };
+          }
+        });
+
+        setCheckins(prev => ({ ...prev, ...patchPayload }));
+
+        if (CONFIG.FIREBASE_DB_URL && Object.keys(patchPayload).length > 0) {
+          const endpoint = `${CONFIG.FIREBASE_DB_URL}/checkins/${CONFIG.EVENT_ID}.json`;
+          try {
+            await fetch(endpoint, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(patchPayload)
+            });
+          } catch (err) {
+            await Promise.all(
+              Object.entries(patchPayload).map(([rKey, rec]) =>
+                fetch(`${CONFIG.FIREBASE_DB_URL}/checkins/${CONFIG.EVENT_ID}/${encodeURIComponent(rKey)}.json`, {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(rec)
+                })
+              )
+            );
+          }
+        }
+
+        setIsSubmittingBatch(false);
+        setBatchConfirmModalOpen(false);
+        setDraftBatch({});
+      };
+
+      const resetMemberToAbsent = async (recordKey) => {
+        setCheckins(prev => {
+          const next = { ...prev };
+          delete next[recordKey];
+          return next;
+        });
+        if (!CONFIG.FIREBASE_DB_URL) return;
+
+        const endpoint = `${CONFIG.FIREBASE_DB_URL}/checkins/${CONFIG.EVENT_ID}/${encodeURIComponent(recordKey)}.json`;
+        await fetch(endpoint, { method: "DELETE" });
+      };
+
+      const openLeaveReasonModal = (person, mode = "single") => {
+        setSingleConfirmPresentId(null);
+        if (mode === "draft" && draftBatch[person.memberId]?.status === "leave") {
+          setDraftBatch(prev => {
+            const next = { ...prev };
+            delete next[person.memberId];
+            return next;
+          });
+          return;
+        }
+        setLeaveTypeInput("事假");
+        setLeaveCustomNote("");
+        setLeaveModal({ person, mode });
+      };
+
+      const handleConfirmLeaveModal = async (e) => {
+        e.preventDefault();
+        if (!leaveModal) return;
+        const { person, mode } = leaveModal;
+        const cleanNote = leaveCustomNote.trim();
+
+        if (leaveTypeInput === "自行填寫" && !cleanNote) {
+          alert("請輸入請假原因或預計到達時間！");
+          return;
+        }
+
+        if (mode === "draft") {
+          setDraftBatch(prev => ({
+            ...prev,
+            [person.memberId]: {
+              status: "leave",
+              leaveType: leaveTypeInput,
+              leaveNote: cleanNote
+            }
+          }));
+        } else {
+          await submitSingleRecord(person.memberId, {
+            status: "leave",
+            leaveType: leaveTypeInput,
+            leaveNote: cleanNote,
+            method: "self"
+          });
+        }
+        setLeaveModal(null);
+      };
+
+      const handleOpenEditLockedMember = (member) => {
+        requireAdmin(() => {
+          const cur = checkins[member.memberId];
+          setEditLeaveType(cur?.leaveType || "事假");
+          setEditLeaveNote(cur?.leaveNote || "");
+          setEditTargetMember(member);
+        });
+      };
+
+      const toggleDraftPresent = (recordKey) => {
+        setSingleConfirmPresentId(null);
+        setDraftBatch(prev => {
+          const next = { ...prev };
+          if (next[recordKey]?.status === "present") {
+            delete next[recordKey];
+          } else {
+            next[recordKey] = { status: "present" };
+          }
+          return next;
+        });
+      };
+
+      const selectAllAbsentInZone = (zoneMembers) => {
+        const next = { ...draftBatch };
+        zoneMembers.forEach(m => {
+          if (!checkins[m.memberId]) {
+            next[m.memberId] = { status: "present" };
+          }
+        });
+        setDraftBatch(next);
+      };
+
+      const handleImportCSV = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = async (evt) => {
+          const lines = evt.target.result.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+          if (lines.length < 2) {
+            alert("CSV 檔案內容過少或格式不正確！");
+            return;
+          }
+
+          const firstCols = lines[0].split(",").map(c => c.trim());
+          const hasHeader = /性別|編號|求道名|單位|區域|memberId/i.test(lines[0]);
+          const offset = /memberId/i.test(firstCols[0]) ? 1 : 0;
+          const startIdx = hasHeader ? 1 : 0;
+
+          const imported = lines.slice(startIdx).map((line, idx) => {
+            const cols = line.split(",").map(c => c.trim());
+            const gender = cols[0 + offset] || "乾";
+            const code = cols[1 + offset] || String(idx + 1).padStart(3, "0");
+            const name = cols[2 + offset] || `未命名_${idx + 1}`;
+            const unit = cols[3 + offset] || "未分單位";
+            const region = cols[4 + offset] || "未分區域";
+            return {
+              memberId: makeRecordKey(gender, code, name, idx + 1),
+              gender,
+              code,
+              name,
+              unit,
+              region
+            };
+          });
+
+          setRoster(imported);
+          localStorage.setItem(`ROSTER_5COL_${CONFIG.EVENT_ID}`, JSON.stringify(imported));
+          setSelectedUnit("ALL");
+          setSelectedRegion("ALL");
+
+          if (CONFIG.FIREBASE_DB_URL) {
+            setIsUploadingRoster(true);
+            setRosterSyncStatus("正在上傳 5 欄名單至 ikt-1000...");
+            try {
+              const res = await fetch(`${CONFIG.FIREBASE_DB_URL}/rosters/${CONFIG.EVENT_ID}.json`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(imported)
+              });
+              if (res.ok) {
+                setRosterSyncStatus(`已同步雲端名單 (${imported.length}人)`);
+                alert(`✅ 成功匯入 ${imported.length} 筆 5 欄名單至 ikt-1000 雲端！`);
+              } else {
+                throw new Error("HTTP " + res.status);
+              }
+            } catch (err) {
+              setRosterSyncStatus("雲端上傳失敗");
+              alert("⚠️ 上傳至 ikt-1000 失敗，請檢查 Firebase Rules 權限！");
+            } finally {
+              setIsUploadingRoster(false);
+            }
+          }
+        };
+        reader.readAsText(file, "UTF-8");
+        e.target.value = "";
+      };
+
+      const handleClearAllCheckins = () => {
+        requireAdmin(async () => {
+          if (!confirm("⚠️ 確定要【清空全場所有已簽到與請假紀錄】嗎？此動作無法復原！")) return;
+          setCheckins({});
+          setDraftBatch({});
+          setRecentScans([]);
+          setScanResultBanner(null);
+          localStorage.removeItem(`CHECKINS_5COL_${CONFIG.EVENT_ID}`);
+
+          if (CONFIG.FIREBASE_DB_URL) {
+            await fetch(`${CONFIG.FIREBASE_DB_URL}/checkins/${CONFIG.EVENT_ID}.json`, { method: "DELETE" });
+            alert("✅ 已成功清空雲端與本機的所有紀錄！");
+          }
+        });
+      };
+
+      const handleTriggerSheetSync = async () => {
+        if (!CONFIG.GAS_SYNC_URL) return;
+        setIsSyncingSheet(true);
+        try {
+          await fetch(CONFIG.GAS_SYNC_URL, {
+            method: "POST",
+            mode: "no-cors",
+            body: JSON.stringify({ action: "sync" })
+          });
+          alert("✅ 已發送同步指令至 Google 試算表！\n請等待約 2～3 秒，試算表的「簽到總表」、「單位區域統計（含小計）」與「缺席名單」即會更新。");
+        } catch (err) {
+          alert("⚠️ 網路連線異常，觸發失敗，請直接在試算表內點選同步選單。");
+        } finally {
+          setIsSyncingSheet(false);
+        }
+      };
+
+      const stats = useMemo(() => {
+        const unitMap = {};
+        const regionMap = {};
+        let totalPresent = 0, totalLeave = 0, totalLate = 0;
+        let maleTotal = 0, malePresent = 0;
+        let femaleTotal = 0, femalePresent = 0;
+
+        roster.forEach(p => {
+          const c = checkins[p.memberId];
+          const isPresent = c?.status === "present";
+          const isLeave = c?.status === "leave";
+          const isLate = isLeave && c?.leaveType === "晚到";
+          const isM = isMaleGender(p.gender);
+          const isF = isFemaleGender(p.gender);
+
+          if (isPresent) totalPresent++;
+          if (isLeave) totalLeave++;
+          if (isLate) totalLate++;
+          if (isM) { maleTotal++; if (isPresent) malePresent++; }
+          if (isF) { femaleTotal++; if (isPresent) femalePresent++; }
+
+          if (!unitMap[p.unit]) {
+            unitMap[p.unit] = {
+              name: p.unit,
+              total: 0, present: 0, leave: 0, late: 0,
+              maleTotal: 0, malePresent: 0,
+              femaleTotal: 0, femalePresent: 0
+            };
+          }
+          const u = unitMap[p.unit];
+          u.total++;
+          if (isPresent) u.present++;
+          if (isLeave) u.leave++;
+          if (isLate) u.late++;
+          if (isM) { u.maleTotal++; if (isPresent) u.malePresent++; }
+          if (isF) { u.femaleTotal++; if (isPresent) u.femalePresent++; }
+
+          if (selectedUnit === "ALL" || p.unit === selectedUnit) {
+            const regionKey = `${p.unit}_${p.region}`;
+            if (!regionMap[regionKey]) {
+              regionMap[regionKey] = {
+                key: regionKey,
+                name: p.region,
+                unit: p.unit,
+                total: 0, present: 0, leave: 0, late: 0,
+                maleTotal: 0, malePresent: 0,
+                femaleTotal: 0, femalePresent: 0
+              };
+            }
+            const r = regionMap[regionKey];
+            r.total++;
+            if (isPresent) r.present++;
+            if (isLeave) r.leave++;
+            if (isLate) r.late++;
+            if (isM) { r.maleTotal++; if (isPresent) r.malePresent++; }
+            if (isF) { r.femaleTotal++; if (isPresent) r.femalePresent++; }
+          }
+        });
+
+        const sortedUnits = Object.values(unitMap).sort((a, b) => sortByNumberAsc(a.name, b.name));
+        const sortedRegions = Object.values(regionMap).sort((a, b) => {
+          const uCompare = sortByNumberAsc(a.unit, b.unit);
+          if (uCompare !== 0) return uCompare;
+          return sortByNumberAsc(a.name, b.name);
+        });
+
+        return {
+          total: roster.length,
+          present: totalPresent,
+          leave: totalLeave,
+          late: totalLate,
+          absent: roster.length - totalPresent - totalLeave,
+          rate: roster.length ? ((totalPresent / roster.length) * 100).toFixed(1) : "0.0",
+          maleTotal, malePresent,
+          femaleTotal, femalePresent,
+          units: sortedUnits,
+          regions: sortedRegions
+        };
+      }, [roster, checkins, selectedUnit]);
+
+      const checkinRegionsForUnit = useMemo(() => {
+        if (!checkinUnit) return [];
+        const map = {};
+        roster.forEach(p => {
+          if (p.unit === checkinUnit) {
+            if (!map[p.region]) map[p.region] = { name: p.region, total: 0, present: 0, leave: 0 };
+            map[p.region].total++;
+            const st = checkins[p.memberId]?.status;
+            if (st === "present") map[p.region].present++;
+            if (st === "leave") map[p.region].leave++;
+          }
+        });
+        return Object.values(map).sort((a, b) => sortByNumberAsc(a.name, b.name));
+      }, [roster, checkins, checkinUnit]);
+
+      const checkinZoneMembers = useMemo(() => {
+        if (!checkinUnit || !checkinRegion) return [];
+        return roster.filter(p => {
+          if (p.unit !== checkinUnit || p.region !== checkinRegion) return false;
+          if (checkinSearchFilter.trim()) {
+            const q = checkinSearchFilter.trim().toLowerCase();
+            return (
+              p.name.toLowerCase().includes(q) ||
+              p.code.toLowerCase().includes(q)
+            );
+          }
+          return true;
+        });
+      }, [roster, checkinUnit, checkinRegion, checkinSearchFilter]);
+
+      const searchMatches = useMemo(() => {
+        const q = queryInput.trim().toLowerCase();
+        if (!q) return [];
+        return roster
+          .filter(m =>
+            m.code.toLowerCase().includes(q) ||
+            m.name.toLowerCase().includes(q)
+          )
+          .slice(0, 15);
+      }, [roster, queryInput]);
+
+      const filteredList = useMemo(() => {
+        return roster.filter(p => {
+          if (selectedUnit !== "ALL" && p.unit !== selectedUnit) return false;
+          if (selectedRegion !== "ALL" && p.region !== selectedRegion) return false;
+          if (genderFilter === "MALE" && !isMaleGender(p.gender)) return false;
+          if (genderFilter === "FEMALE" && !isFemaleGender(p.gender)) return false;
+
+          const c = checkins[p.memberId];
+          const st = c?.status || "absent";
+          if (statusFilter === "PRESENT" && st !== "present") return false;
+          if (statusFilter === "ABSENT" && st !== "absent") return false;
+          if (statusFilter === "LEAVE" && st !== "leave") return false;
+          if (statusFilter === "LATE" && !(st === "leave" && c?.leaveType === "晚到")) return false;
+
+          if (searchKeyword) {
+            const q = searchKeyword.trim().toLowerCase();
+            return (
+              p.code.toLowerCase().includes(q) ||
+              p.name.toLowerCase().includes(q) ||
+              p.unit.toLowerCase().includes(q) ||
+              p.region.toLowerCase().includes(q) ||
+              (c?.leaveType || "").toLowerCase().includes(q) ||
+              (c?.leaveNote || "").toLowerCase().includes(q)
+            );
+          }
+          return true;
+        });
+      }, [roster, checkins, selectedUnit, selectedRegion, genderFilter, statusFilter, searchKeyword]);
+
+      const exportCSV = (isTemplate = false) => {
+        if (isTemplate) {
+          const sample = "\uFEFF性別,編號,求道名,單位,區域\n坤,001,簡薇瑄,中和,044區\n乾,001,王大明,正和,015區\n乾,002,陳建宏,正和,001區";
+          const blob = new Blob([sample], { type: "text/csv;charset=utf-8;" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob);
+          a.download = "點名匯入範本_5欄免ID.csv";
+          a.click();
+          return;
+        }
+
+        const headers = ["性別", "編號", "求道名", "單位", "區域", "出席狀態", "請假備註", "登記時間", "登記方式"];
+        const rows = roster.map(p => {
+          const c = checkins[p.memberId];
+          let stText = "未到";
+          if (c?.status === "present") stText = "已出席";
+          else if (c?.status === "leave") {
+            stText = c.leaveType === "晚到" ? "晚到" : `請假(${c.leaveType || "事假"})`;
+          }
+          const noteText = c?.leaveNote || "-";
+          const tText = c?.time ? new Date(c.time).toLocaleTimeString("zh-TW", { hour12: false }) : "-";
+          const mText =
+            c?.method === "qr" ? "名牌掃碼" :
+            c?.method === "admin" ? "管理員修改" :
+            c?.method === "batch" ? "區域批次" :
+            c?.method === "self" ? "單筆點名" : "-";
+          return [p.gender, p.code, p.name, p.unit, p.region, stText, noteText, tText, mText].join(",");
+        });
+        const csv = "\uFEFF" + [headers.join(","), ...rows].join("\n");
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = `單位區域出席總表_${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+      };
+
+      const renderMemberActionButtons = (person, allowBatchDraft = false) => {
+        const existingRecord = checkins[person.memberId];
+        const draftItem = draftBatch[person.memberId];
+        const isPromptingPresent = singleConfirmPresentId === person.memberId;
+
+        if (existingRecord) {
+          return (
+            <button
+              type="button"
+              onClick={() => handleOpenEditLockedMember(person)}
+              className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-600 text-xs font-medium inline-flex items-center gap-1 transition"
+            >
+              <span>🔒 修改狀態</span>
+            </button>
+          );
+        }
+
+        return (
+          <div className="flex items-center justify-end gap-1.5 flex-wrap">
+            {allowBatchDraft && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => toggleDraftPresent(person.memberId)}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border transition ${
+                    draftItem?.status === "present"
+                      ? "bg-emerald-500 text-slate-950 border-emerald-300 ring-2 ring-emerald-400/50"
+                      : "bg-slate-900 hover:bg-slate-800 text-emerald-300 border-emerald-700/70"
+                  }`}
+                >
+                  {draftItem?.status === "present" ? "☑ 預選簽到" : "☐ 預選簽到"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openLeaveReasonModal(person, "draft")}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border transition ${
+                    draftItem?.status === "leave"
+                      ? "bg-amber-400 text-slate-950 border-amber-200 ring-2 ring-amber-400/50"
+                      : "bg-slate-900 hover:bg-slate-800 text-amber-300 border-amber-700/70"
+                  }`}
+                >
+                  {draftItem?.status === "leave"
+                    ? `☑ 預選${draftItem.leaveType}${draftItem.leaveNote ? `(${draftItem.leaveNote})` : ""}`
+                    : "☐ 預選請假"}
+                </button>
+              </>
+            )}
+
+            {isPromptingPresent ? (
+              <button
+                type="button"
+                onClick={() => submitSingleRecord(person.memberId, { status: "present", method: "self" })}
+                className="px-3 py-1.5 rounded-lg bg-yellow-400 hover:bg-yellow-300 text-slate-950 font-extrabold text-xs shadow-lg animate-pulse"
+              >
+                👉 確定送出簽到？
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setSingleConfirmPresentId(person.memberId)}
+                className="px-2.5 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold transition"
+              >
+                {allowBatchDraft ? "單筆速簽" : "簽到"}
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={() => openLeaveReasonModal(person, "single")}
+              className="px-2.5 py-1.5 rounded-lg bg-amber-700 hover:bg-amber-600 text-white text-xs font-semibold transition"
+            >
+              請假
+            </button>
+          </div>
+        );
+      };
+
+      const renderStatusBadge = (c) => {
+        if (!c) {
+          return (
+            <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/30">
+              ✕ 未到
+            </span>
+          );
+        }
+        if (c.status === "present") {
+          return (
+            <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+              ● 已到 {new Date(c.time).toLocaleTimeString("zh-TW", { hour12: false })}
+              {c.method === "qr" && <span className="ml-1 text-[10px] px-1 rounded bg-emerald-400/20 text-emerald-200">掃碼</span>}
+            </span>
+          );
+        }
+        if (c.status === "leave") {
+          const isLate = c.leaveType === "晚到";
+          const label = isLate
+            ? `🕒 晚到${c.leaveNote ? `：${c.leaveNote}` : ""}`
+            : `▲ 請假(${c.leaveType || "事假"})${c.leaveNote ? `：${c.leaveNote}` : ""}`;
+          return (
+            <span
+              className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border ${
+                isLate
+                  ? "bg-purple-500/20 text-purple-300 border-purple-500/40 font-semibold"
+                  : "bg-amber-500/20 text-amber-300 border-amber-500/30"
+              }`}
+            >
+              {label}
+            </span>
+          );
+        }
+        return null;
+      };
+
+      const draftEntries = Object.entries(draftBatch);
+      const draftPresentCount = draftEntries.filter(([, item]) => item.status === "present").length;
+      const draftLeaveCount = draftEntries.filter(([, item]) => item.status === "leave").length;
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          <input ref={fileInputRef} type="file" accept=".csv" onChange={handleImportCSV} className="hidden" />
+
+          {/* 彈窗 1：請假原因選擇視窗 */}
+          {leaveModal && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <form
+                onSubmit={handleConfirmLeaveModal}
+                className="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4"
+              >
+                <div className="flex items-center justify-between">
+                  <h3 className="text-base font-bold text-white">📋 登記請假 / 晚到原因</h3>
+                  <button type="button" onClick={() => setLeaveModal(null)} className="text-slate-400 hover:text-white text-sm">✕</button>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-700 rounded-xl p-3 text-sm">
+                  <span className="font-bold text-white text-base">{leaveModal.person.name}</span>
+                  <span className="ml-2 font-mono text-xs text-amber-300">({leaveModal.person.gender} / {leaveModal.person.code})</span>
+                  <div className="text-xs text-slate-400 mt-0.5">
+                    {leaveModal.person.unit} ／ {leaveModal.person.region}
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="block text-xs font-semibold text-slate-300">請點選假別或狀態：</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {LEAVE_REASONS.map(reason => {
+                      const active = leaveTypeInput === reason;
+                      return (
+                        <button
+                          key={reason}
+                          type="button"
+                          onClick={() => setLeaveTypeInput(reason)}
+                          className={`py-2.5 px-2 rounded-xl text-xs font-bold border transition ${
+                            active
+                              ? reason === "晚到"
+                                ? "bg-purple-600 text-white border-purple-300 ring-2 ring-purple-400/50"
+                                : "bg-amber-500 text-slate-950 border-amber-200 ring-2 ring-amber-400/50"
+                              : "bg-slate-900 hover:bg-slate-700 text-slate-200 border-slate-700"
+                          }`}
+                        >
+                          {reason === "晚到" ? "🕒 晚到" : reason}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className="block text-xs text-slate-300">
+                    {leaveTypeInput === "自行填寫"
+                      ? "請輸入具體原因（必填）："
+                      : leaveTypeInput === "晚到"
+                      ? "預計抵達時間或備註（選填，例如 10:30 到）："
+                      : "補充說明（選填）："}
+                  </label>
+                  <input
+                    type="text"
+                    required={leaveTypeInput === "自行填寫"}
+                    value={leaveCustomNote}
+                    onChange={e => setLeaveCustomNote(e.target.value)}
+                    placeholder={
+                      leaveTypeInput === "晚到"
+                        ? "例如：約 10:30 抵達..."
+                        : leaveTypeInput === "自行填寫"
+                        ? "請輸入請假原因..."
+                        : "選填備註..."
+                    }
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-amber-400"
+                  />
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  <button type="button" onClick={() => setLeaveModal(null)} className="flex-1 py-2.5 rounded-xl bg-slate-700 hover:bg-slate-600 text-xs text-slate-300">取消</button>
+                  <button type="submit" className="flex-1 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold text-xs shadow-lg transition">
+                    {leaveModal.mode === "draft" ? "加入本批預選" : "👉 確定送出登記"}
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+
+          {/* 彈窗 2：管理員密碼驗證視窗 */}
+          {pinModalOpen && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <form onSubmit={handleVerifyPin} className="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-sm w-full shadow-2xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-base font-bold text-white flex items-center gap-2">🔒 請輸入管理員密碼</h3>
+                  <button type="button" onClick={() => setPinModalOpen(false)} className="text-slate-400 hover:text-white text-sm">✕</button>
+                </div>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  為防止誤觸，<b>修改已有簽到/請假紀錄的人員</b>、匯入名單或清空紀錄需驗證管理員密碼（預設 8888）。
+                </p>
+                <input
+                  type="password"
+                  autoFocus
+                  required
+                  value={pinInput}
+                  onChange={e => setPinInput(e.target.value)}
+                  placeholder="請輸入密碼..."
+                  className="w-full px-4 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-white text-center text-lg tracking-widest focus:outline-none focus:border-indigo-500"
+                />
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setPinModalOpen(false)} className="flex-1 py-2.5 rounded-xl bg-slate-700 hover:bg-slate-600 text-xs text-slate-300">取消</button>
+                  <button type="submit" className="flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white">驗證並繼續</button>
+                </div>
+              </form>
+            </div>
+          )}
+
+          {/* 彈窗 3：修改已簽到/請假人員狀態 */}
+          {editTargetMember && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-base font-bold text-white">✏️ 修改出席 / 請假狀態</h3>
+                  <button onClick={() => setEditTargetMember(null)} className="text-slate-400 hover:text-white text-sm">✕</button>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-700 rounded-xl p-3 text-sm space-y-1">
+                  <div className="font-bold text-white text-base">
+                    {editTargetMember.name} <span className="text-amber-300 font-mono text-xs">({editTargetMember.gender} / {editTargetMember.code})</span>
+                  </div>
+                  <div className="text-xs text-slate-400">{editTargetMember.unit} ／ {editTargetMember.region}</div>
+                  <div className="pt-1">{renderStatusBadge(checkins[editTargetMember.memberId])}</div>
+                </div>
+
+                <button
+                  onClick={async () => {
+                    await submitSingleRecord(editTargetMember.memberId, { status: "present", method: "admin" });
+                    setEditTargetMember(null);
+                  }}
+                  className="w-full py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm transition"
+                >
+                  ● 改為【已出席】（人已到場）
+                </button>
+
+                <div className="bg-slate-900/80 border border-slate-700 rounded-xl p-3 space-y-2.5">
+                  <div className="text-xs font-bold text-amber-300">或更改為請假 / 晚到：</div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {LEAVE_REASONS.map(r => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => setEditLeaveType(r)}
+                        className={`py-1.5 rounded-lg text-xs font-bold border ${
+                          editLeaveType === r ? "bg-amber-500 text-slate-950 border-amber-200" : "bg-slate-800 text-slate-300 border-slate-700"
+                        }`}
+                      >
+                        {r}
+                      </button>
+                    ))}
+                  </div>
+                  <input
+                    type="text"
+                    value={editLeaveNote}
+                    onChange={e => setEditLeaveNote(e.target.value)}
+                    placeholder="原因或預計時間備註（自行填寫時必填）..."
+                    className="w-full px-3 py-2 rounded-lg bg-slate-800 border border-slate-700 text-xs text-white"
+                  />
+                  <button
+                    onClick={async () => {
+                      if (editLeaveType === "自行填寫" && !editLeaveNote.trim()) {
+                        alert("請輸入請假原因！");
+                        return;
+                      }
+                      await submitSingleRecord(editTargetMember.memberId, {
+                        status: "leave",
+                        leaveType: editLeaveType,
+                        leaveNote: editLeaveNote.trim(),
+                        method: "admin"
+                      });
+                      setEditTargetMember(null);
+                    }}
+                    className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs transition"
+                  >
+                    ▲ 儲存為【{editLeaveType}】
+                  </button>
+                </div>
+
+                <button
+                  onClick={async () => {
+                    await resetMemberToAbsent(editTargetMember.memberId);
+                    setEditTargetMember(null);
+                  }}
+                  className="w-full py-2 rounded-xl bg-rose-800/80 hover:bg-rose-700 text-rose-100 font-semibold text-xs transition"
+                >
+                  ✕ 清除紀錄，改回【未到】
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* 彈窗 4：整批預選送出前二次確認清單 */}
+          {batchConfirmModalOpen && (
+            <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+              <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-4">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-lg font-bold text-white">✅ 確認送出本批點名（共 {draftEntries.length} 人）</h3>
+                  <button onClick={() => setBatchConfirmModalOpen(false)} className="text-slate-400 hover:text-white text-sm">✕</button>
+                </div>
+
+                <div className="flex gap-3 text-xs">
+                  <span className="px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">
+                    簽到：{draftPresentCount} 人
+                  </span>
+                  <span className="px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold">
+                    請假/晚到：{draftLeaveCount} 人
+                  </span>
+                </div>
+
+                <div className="max-h-60 overflow-y-auto bg-slate-900 border border-slate-700 rounded-xl p-3 divide-y divide-slate-800 text-sm">
+                  {draftEntries.map(([rKey, item]) => {
+                    const m = roster.find(x => x.memberId === rKey);
+                    if (!m) return null;
+                    return (
+                      <div key={rKey} className="py-2 flex items-center justify-between gap-2">
+                        <div>
+                          <span className="font-bold text-white">{m.name}</span>
+                          <span className="ml-2 text-xs text-slate-400 font-mono">({m.gender}/{m.code}・{m.region})</span>
+                        </div>
+                        <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                          item.status === "present"
+                            ? "bg-emerald-500/20 text-emerald-300"
+                            : item.leaveType === "晚到"
+                            ? "bg-purple-500/20 text-purple-300"
+                            : "bg-amber-500/20 text-amber-300"
+                        }`}>
+                          {item.status === "present"
+                            ? "● 簽到"
+                            : `${item.leaveType}${item.leaveNote ? `(${item.leaveNote})` : ""}`}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <p className="text-xs text-amber-300/90">
+                  ⚠️ 送出後人員狀態即會鎖定，若需再次修改需輸入管理員密碼。
+                </p>
+
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setBatchConfirmModalOpen(false)} className="flex-1 py-3 rounded-xl bg-slate-700 hover:bg-slate-600 text-xs font-semibold text-slate-200">返回修改</button>
+                  <button type="button" disabled={isSubmittingBatch} onClick={submitBatchCheckins} className="flex-1 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-sm font-extrabold text-white shadow-lg shadow-emerald-600/30 disabled:opacity-50">
+                    {isSubmittingBatch ? "傳送雲端中..." : "確認正式送出"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 頂部導覽列 */}
+          <header className="bg-slate-950 border-b border-slate-800 px-4 py-3 sticky top-0 z-30">
+            <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <span className="h-3 w-3 rounded-full bg-emerald-400 animate-pulse"></span>
+                <h1 className="text-lg font-bold text-white tracking-wide">
+                  千人即時點名與單位區域戰情系統
+                </h1>
+                <span className="text-xs px-2.5 py-0.5 rounded-full bg-slate-800 text-emerald-300 border border-slate-700">
+                  🟢 ikt-1000 & 試算表已連線 ｜ {rosterSyncStatus}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {isAdminUnlocked ? (
+                  <button
+                    onClick={handleLockAdmin}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 transition"
+                  >
+                    🔓 修改權限已解鎖 (點擊上鎖)
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => requireAdmin(() => {})}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 text-slate-400 border border-slate-700 hover:text-white transition"
+                  >
+                    🔒 管理員解鎖
+                  </button>
+                )}
+
+                {!isCheckinOnly && (
+                  <>
+                    <button
+                      onClick={() => setView("dashboard")}
+                      className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition ${
+                        view === "dashboard"
+                          ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/30"
+                          : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                      }`}
+                    >
+                      📊 單位/區域戰情室
+                    </button>
+                    <button
+                      onClick={() => setView("checkin")}
+                      className={`px-3.5 py-1.5 rounded-lg text-sm font-medium transition ${
+                        view === "checkin"
+                          ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/30"
+                          : "bg-slate-800 text-slate-300 hover:bg-slate-700"
+                      }`}
+                    >
+                      📱 掃碼 / 區域簽到端
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          </header>
+
+          {/* ========================================== */}
+          {/* 視角 A：單位/區域即時戰情室 */}
+          {/* ========================================== */}
+          {view === "dashboard" && (
+            <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 space-y-6">
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+                <div
+                  onClick={() => { setStatusFilter("ALL"); setGenderFilter("ALL"); }}
+                  className="bg-slate-800/90 border border-slate-700 rounded-xl p-4 cursor-pointer hover:border-slate-500 transition"
+                >
+                  <div className="text-xs text-slate-400">全場應到總數</div>
+                  <div className="text-3xl font-extrabold text-white mt-1">{stats.total}</div>
+                  <div className="text-xs text-slate-400 mt-1.5 flex justify-between">
+                    <span>乾: {stats.maleTotal}</span>
+                    <span>坤: {stats.femaleTotal}</span>
+                    <span>{stats.units.length}單位 / {stats.regions.length}區域</span>
+                  </div>
+                </div>
+
+                <div
+                  onClick={() => setStatusFilter("PRESENT")}
+                  className="bg-emerald-950/60 border border-emerald-700/60 rounded-xl p-4 cursor-pointer hover:bg-emerald-900/40 transition"
+                >
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-emerald-300">實到人數</span>
+                    <span className="text-xs font-bold px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300">
+                      {stats.rate}%
+                    </span>
+                  </div>
+                  <div className="text-3xl font-extrabold text-emerald-400 mt-1">{stats.present}</div>
+                  <div className="text-xs text-emerald-300/80 mt-1.5 flex justify-between">
+                    <span>乾實到: {stats.malePresent}</span>
+                    <span>坤實到: {stats.femalePresent}</span>
+                  </div>
+                </div>
+
+                <div
+                  onClick={() => setStatusFilter("ABSENT")}
+                  className="bg-rose-950/60 border border-rose-700/60 rounded-xl p-4 cursor-pointer hover:bg-rose-900/40 transition"
+                >
+                  <div className="text-xs text-rose-300">尚未報到 (點擊查未到)</div>
+                  <div className="text-3xl font-extrabold text-rose-400 mt-1">{stats.absent}</div>
+                  <div className="text-xs text-rose-300/80 mt-1.5">
+                    未到者免密碼即可點名
+                  </div>
+                </div>
+
+                <div
+                  onClick={() => setStatusFilter("LEAVE")}
+                  className="bg-amber-950/60 border border-amber-700/60 rounded-xl p-4 cursor-pointer hover:bg-amber-900/40 transition"
+                >
+                  <div className="flex justify-between items-center">
+                    <span className="text-xs text-amber-300">請假 / 晚到總計</span>
+                    {stats.late > 0 && (
+                      <span
+                        onClick={(e) => { e.stopPropagation(); setStatusFilter("LATE"); }}
+                        className="text-[11px] font-bold px-1.5 py-0.5 rounded bg-purple-500/30 text-purple-200 border border-purple-400/40"
+                      >
+                        含晚到 {stats.late}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-3xl font-extrabold text-amber-400 mt-1">{stats.leave}</div>
+                  <div className="text-xs text-amber-300/80 mt-1.5">
+                    含事/病/公假/晚到/自填
+                  </div>
+                </div>
+
+                <div className="col-span-2 lg:col-span-1 bg-slate-800/90 border border-slate-700 rounded-xl p-3 flex flex-col justify-between gap-2">
+                  <button
+                    onClick={handleTriggerSheetSync}
+                    disabled={isSyncingSheet}
+                    className="w-full py-2 px-3 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold text-xs shadow transition disabled:opacity-50"
+                  >
+                    {isSyncingSheet ? "🔄 同步至試算表中..." : "🔄 立即同步至試算表"}
+                  </button>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      onClick={() => requireAdmin(() => fileInputRef.current?.click())}
+                      disabled={isUploadingRoster}
+                      className="py-1.5 px-2 rounded bg-indigo-700 hover:bg-indigo-600 text-xs text-white font-medium text-center transition disabled:opacity-50"
+                    >
+                      {isUploadingRoster ? "上傳中..." : "🔒 匯入 5 欄 CSV"}
+                    </button>
+                    <button
+                      onClick={() => exportCSV(false)}
+                      className="py-1.5 px-2 rounded bg-sky-700 hover:bg-sky-600 text-xs text-white font-medium transition"
+                    >
+                      匯出結果 CSV
+                    </button>
+                    <button
+                      onClick={() => exportCSV(true)}
+                      className="py-1 px-2 rounded bg-slate-700 hover:bg-slate-600 text-[11px] text-slate-300 transition"
+                    >
+                      下載5欄範本
+                    </button>
+                    <button
+                      onClick={handleClearAllCheckins}
+                      className="py-1 px-2 rounded bg-rose-900/70 hover:bg-rose-800 text-[11px] text-rose-200 transition"
+                    >
+                      🔒 清空簽到紀錄
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* 第一層：各「單位」即時出席率 */}
+              <section>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base font-bold text-white">🏢 第一層：各【單位】即時出席率</h2>
+                    {selectedUnit !== "ALL" && (
+                      <button
+                        onClick={() => { setSelectedUnit("ALL"); setSelectedRegion("ALL"); }}
+                        className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-600 text-white"
+                      >
+                        顯示全部單位 ({selectedUnit}) ✕
+                      </button>
+                    )}
+                  </div>
+                  <span className="text-xs text-slate-400">點擊任一單位卡片，可向下鑽取該單位所屬的「區域」</span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {stats.units.map(u => {
+                    const pct = u.total ? Math.round((u.present / u.total) * 100) : 0;
+                    const absentCount = u.total - u.present - u.leave;
+                    const isSelected = selectedUnit === u.name;
+                    return (
+                      <div
+                        key={u.name}
+                        onClick={() => {
+                          setSelectedUnit(isSelected ? "ALL" : u.name);
+                          setSelectedRegion("ALL");
+                        }}
+                        className={`p-4 rounded-xl border transition cursor-pointer ${
+                          isSelected
+                            ? "bg-indigo-950/80 border-indigo-400 ring-2 ring-indigo-500/40"
+                            : absentCount === 0
+                            ? "bg-emerald-950/30 border-emerald-700/60 hover:border-emerald-500"
+                            : "bg-slate-800/75 border-slate-700 hover:border-slate-500"
+                        }`}
+                      >
+                        <div className="flex justify-between items-start mb-2">
+                          <div>
+                            <span className="text-base font-bold text-white">{u.name}</span>
+                            <span className="ml-2 text-xs text-slate-400">應到 {u.total}</span>
+                          </div>
+                          <span className={`text-lg font-extrabold ${
+                            absentCount === 0 ? "text-emerald-400" : pct >= 80 ? "text-sky-400" : "text-amber-400"
+                          }`}>
+                            {pct}%
+                          </span>
+                        </div>
+
+                        <div className="w-full h-2 bg-slate-900 rounded-full overflow-hidden mb-2.5">
+                          <div
+                            className={`h-full transition-all duration-300 ${
+                              absentCount === 0 ? "bg-emerald-400" : "bg-indigo-500"
+                            }`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+
+                        <div className="flex justify-between text-xs bg-slate-900/70 rounded-lg px-2.5 py-1.5 mb-2 border border-slate-800">
+                          <span className="text-sky-300">乾: <b>{u.malePresent}</b>/{u.maleTotal}</span>
+                          <span className="text-pink-300">坤: <b>{u.femalePresent}</b>/{u.femaleTotal}</span>
+                        </div>
+
+                        <div className="flex justify-between text-xs">
+                          <span className="text-emerald-400">實到 {u.present}</span>
+                          <span className="text-amber-400">請假 {u.leave}{u.late > 0 ? `(晚${u.late})` : ""}</span>
+                          <span className={absentCount > 0 ? "text-rose-400 font-bold" : "text-emerald-400"}>
+                            {absentCount === 0 ? "✓ 全員到齊" : `未到 ${absentCount}`}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+
+              {/* 第二層：各「區域」即時紅綠燈矩陣 */}
+              <section>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-2">
+                    <h2 className="text-base font-bold text-white">
+                      📍 第二層：各【區域】即時出席狀況 {selectedUnit !== "ALL" && `（${selectedUnit}）`}
+                    </h2>
+                    <span className="text-[11px] px-2 py-0.5 rounded bg-slate-800 text-sky-300 border border-slate-700">
+                      相同單位排一起・區域數字小到大
+                    </span>
+                    {selectedRegion !== "ALL" && (
+                      <button
+                        onClick={() => setSelectedRegion("ALL")}
+                        className="text-xs px-2.5 py-0.5 rounded-full bg-indigo-600 text-white"
+                      >
+                        取消區域篩選 ({selectedRegion}) ✕
+                      </button>
+                    )}
+                  </div>
+                  <span className="text-xs text-slate-400">點擊區域卡片可篩選下方人員明細</span>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+                  {stats.regions.map(r => {
+                    const pct = r.total ? Math.round((r.present / r.total) * 100) : 0;
+                    const absentCount = r.total - r.present - r.leave;
+                    const isSelected = selectedRegion === r.name && (selectedUnit === "ALL" || selectedUnit === r.unit);
+                    return (
+                      <div
+                        key={r.key}
+                        onClick={() => {
+                          if (isSelected) {
+                            setSelectedRegion("ALL");
+                          } else {
+                            setSelectedUnit(r.unit);
+                            setSelectedRegion(r.name);
+                          }
+                        }}
+                        className={`p-3 rounded-xl border transition cursor-pointer ${
+                          isSelected
+                            ? "bg-indigo-950/80 border-indigo-400 ring-2 ring-indigo-500/40"
+                            : absentCount === 0
+                            ? "bg-emerald-950/30 border-emerald-700/50 hover:border-emerald-500"
+                            : "bg-slate-800/60 border-slate-700/80 hover:border-slate-500"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-0.5">
+                          <span className="font-bold text-sm text-white truncate">{r.name}</span>
+                          <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${
+                            absentCount === 0 ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700 text-slate-300"
+                          }`}>
+                            {pct}%
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-emerald-300/90 mb-1.5">{r.unit}</div>
+
+                        <div className="w-full h-1.5 bg-slate-900 rounded-full overflow-hidden mb-2">
+                          <div
+                            className={`h-full transition-all duration-300 ${absentCount === 0 ? "bg-emerald-400" : "bg-sky-400"}`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+
+                        <div className="flex justify-between text-[11px] text-slate-300 mb-1">
+                          <span className="text-sky-300">乾 {r.malePresent}/{r.maleTotal}</span>
+                          <span className="text-pink-300">坤 {r.femalePresent}/{r.femaleTotal}</span>
+                        </div>
+
+                        <div className="flex justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-700/60">
+                          <span>實到 {r.present}/{r.total}</span>
+                          <span className={absentCount > 0 ? "text-rose-400 font-semibold" : "text-emerald-400"}>
+                            {absentCount === 0 ? "✓ 到齊" : `缺 ${absentCount}`}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+
+              {/* 第三層：5 欄人員明細 */}
+              <section className="bg-slate-800/80 border border-slate-700 rounded-xl p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="font-bold text-white">👥 名單明細 ({filteredList.length} 人)</h3>
+
+                    <div className="flex rounded-lg bg-slate-900 p-1 border border-slate-700 text-xs flex-wrap">
+                      {[
+                        { id: "ALL", label: "全部" },
+                        { id: "ABSENT", label: "未到" },
+                        { id: "PRESENT", label: "已到" },
+                        { id: "LEAVE", label: "全部請假" },
+                        { id: "LATE", label: "🕒 晚到" }
+                      ].map(t => (
+                        <button
+                          key={t.id}
+                          onClick={() => setStatusFilter(t.id)}
+                          className={`px-2.5 py-1 rounded-md font-medium transition ${
+                            statusFilter === t.id ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="flex rounded-lg bg-slate-900 p-1 border border-slate-700 text-xs">
+                      {[
+                        { id: "ALL", label: "乾坤全顯" },
+                        { id: "MALE", label: "乾" },
+                        { id: "FEMALE", label: "坤" }
+                      ].map(g => (
+                        <button
+                          key={g.id}
+                          onClick={() => setGenderFilter(g.id)}
+                          className={`px-2.5 py-1 rounded-md font-medium transition ${
+                            genderFilter === g.id ? "bg-sky-600 text-white" : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          {g.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <input
+                    type="text"
+                    placeholder="搜尋編號、求道名、單位、區域或請假原因..."
+                    value={searchKeyword}
+                    onChange={e => setSearchKeyword(e.target.value)}
+                    className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 w-full sm:w-72"
+                  />
+                </div>
+
+                <div className="overflow-x-auto max-h-96">
+                  <table className="w-full text-left border-collapse text-sm">
+                    <thead className="bg-slate-900/95 text-slate-400 text-xs sticky top-0">
+                      <tr>
+                        <th className="py-2.5 px-3">性別</th>
+                        <th className="py-2.5 px-3">編號</th>
+                        <th className="py-2.5 px-3">求道名</th>
+                        <th className="py-2.5 px-3">單位</th>
+                        <th className="py-2.5 px-3">區域</th>
+                        <th className="py-2.5 px-3">出席 / 請假原因</th>
+                        <th className="py-2.5 px-3 text-right">點名操作 (未到免密碼 / 修改需密碼)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-700/60">
+                      {filteredList.slice(0, 120).map(p => {
+                        const c = checkins[p.memberId];
+                        const isM = isMaleGender(p.gender);
+                        return (
+                          <tr key={p.memberId} className="hover:bg-slate-700/30">
+                            <td className="py-2 px-3">
+                              <span className={`text-xs font-bold px-2 py-0.5 rounded ${
+                                isM ? "bg-sky-500/20 text-sky-300" : "bg-pink-500/20 text-pink-300"
+                              }`}>
+                                {p.gender}
+                              </span>
+                            </td>
+                            <td className="py-2 px-3 font-mono text-xs text-amber-300">{p.code}</td>
+                            <td className="py-2 px-3 font-bold text-white">{p.name}</td>
+                            <td className="py-2 px-3 text-emerald-300 font-medium">{p.unit}</td>
+                            <td className="py-2 px-3 font-mono text-sky-300 font-semibold">{p.region}</td>
+                            <td className="py-2 px-3">{renderStatusBadge(c)}</td>
+                            <td className="py-2 px-3 text-right">{renderMemberActionButtons(p, false)}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            </main>
+          )}
+
+          {/* ========================================== */}
+          {/* 視角 B：簽到端 (1. 名牌QR掃碼 | 2. 依單位區域點名 | 3. 關鍵字搜尋) */}
+          {/* ========================================== */}
+          {view === "checkin" && (
+            <main className="flex-1 max-w-4xl w-full mx-auto p-4 md:p-6 space-y-5">
+              <div className="bg-slate-800 border border-slate-700 rounded-2xl p-2 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <button
+                  onClick={() => setCheckinTab("qr")}
+                  className={`py-2.5 px-3 rounded-xl text-sm font-bold transition ${
+                    checkinTab === "qr"
+                      ? "bg-sky-600 text-white shadow-lg shadow-sky-600/30"
+                      : "text-slate-300 hover:bg-slate-700"
+                  }`}
+                >
+                  📷 掃描名牌 QR Code
+                </button>
+                <button
+                  onClick={() => setCheckinTab("zone")}
+                  className={`py-2.5 px-3 rounded-xl text-sm font-bold transition ${
+                    checkinTab === "zone"
+                      ? "bg-emerald-600 text-white shadow-lg shadow-emerald-600/30"
+                      : "text-slate-300 hover:bg-slate-700"
+                  }`}
+                >
+                  🏢 依【單位＋區域】點名
+                </button>
+                <button
+                  onClick={() => setCheckinTab("search")}
+                  className={`py-2.5 px-3 rounded-xl text-sm font-bold transition ${
+                    checkinTab === "search"
+                      ? "bg-indigo-600 text-white shadow-lg shadow-indigo-600/30"
+                      : "text-slate-300 hover:bg-slate-700"
+                  }`}
+                >
+                  🔍 搜尋姓名 / 編號點名
+                </button>
+              </div>
+
+              {/* ========================================== */}
+              {/* 分頁 1：名牌 QR Code 連續掃描器 */}
+              {/* ========================================== */}
+              {checkinTab === "qr" && (
+                <div className="space-y-5">
+                  <div className="bg-slate-800/90 border border-slate-700 rounded-2xl p-5 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-base font-extrabold text-white">📷 名牌 QR Code 連續掃描點名</h3>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          支援名牌 JSON 格式自動解析（比對性別、編號、求道名與單位區域），掃中即自動完成報到。
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => setIsCameraActive(prev => !prev)}
+                        className={`px-4 py-2.5 rounded-xl text-xs font-extrabold shadow transition ${
+                          isCameraActive
+                            ? "bg-rose-600 hover:bg-rose-500 text-white"
+                            : "bg-sky-500 hover:bg-sky-400 text-slate-950"
+                        }`}
+                      >
+                        {isCameraActive ? "⏹ 關閉相機鏡頭" : "📸 開啟手機相機連續掃描"}
+                      </button>
+                    </div>
+
+                    {cameraError && (
+                      <div className="p-3 rounded-xl bg-rose-950/70 border border-rose-600/60 text-xs text-rose-200">
+                        {cameraError}
+                      </div>
+                    )}
+
+                    {/* 相機取景框 */}
+                    {isCameraActive && (
+                      <div className="max-w-sm mx-auto overflow-hidden rounded-2xl border-2 border-sky-500 bg-black">
+                        <div id="qr-reader-box" className="w-full"></div>
+                      </div>
+                    )}
+
+                    {/* 掃描結果即時回饋大橫幅 */}
+                    {scanResultBanner && (
+                      <div
+                        className={`p-4 rounded-xl border-2 transition ${
+                          scanResultBanner.type === "success"
+                            ? "bg-emerald-950/80 border-emerald-400 text-emerald-100"
+                            : scanResultBanner.type === "duplicate"
+                            ? "bg-amber-950/80 border-amber-400 text-amber-100"
+                            : scanResultBanner.type === "ambiguous"
+                            ? "bg-indigo-950/80 border-indigo-400 text-indigo-100"
+                            : "bg-rose-950/80 border-rose-400 text-rose-100"
+                        }`}
+                      >
+                        <div className="text-base font-extrabold">{scanResultBanner.title}</div>
+                        <div className="text-xs opacity-90 mt-1">{scanResultBanner.detail}</div>
+
+                        {/* 若發生同編號同姓名衝突，提供按鈕直接點選 */}
+                        {scanResultBanner.type === "ambiguous" && scanResultBanner.candidates && (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {scanResultBanner.candidates.map(c => (
+                              <button
+                                key={c.memberId}
+                                type="button"
+                                onClick={async () => {
+                                  if (checkins[c.memberId]) {
+                                    alert("此人員已完成登記！");
+                                    return;
+                                  }
+                                  playBeepSound("success");
+                                  await submitSingleRecord(c.memberId, { status: "present", method: "qr" });
+                                  setScanResultBanner({
+                                    type: "success",
+                                    title: `✅ 報到成功：${c.name}`,
+                                    detail: `${c.unit} ／ ${c.region} ／ ${c.gender} ${c.code}`
+                                  });
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-emerald-500 text-slate-950 font-bold text-xs"
+                              >
+                                點選：{c.unit} {c.region} - {c.name} ({c.code})
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* 實體掃碼槍 / 貼上 QR 測試輸入框 */}
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        if (!gunInput.trim()) return;
+                        handleScannedQRText(gunInput);
+                        setGunInput("");
+                      }}
+                      className="pt-2 border-t border-slate-700/80 flex gap-2"
+                    >
+                      <input
+                        type="text"
+                        value={gunInput}
+                        onChange={e => setGunInput(e.target.value)}
+                        placeholder="實體掃碼槍接收框（或貼上名牌 QR JSON 內容按 Enter 測試）..."
+                        className="flex-1 px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-sky-500"
+                      />
+                      <button
+                        type="submit"
+                        className="px-4 py-2 rounded-xl bg-slate-700 hover:bg-slate-600 text-xs font-bold text-white"
+                      >
+                        送出比對
+                      </button>
+                    </form>
+                  </div>
+
+                  {/* 本機剛掃描成功的最近紀錄 */}
+                  {recentScans.length > 0 && (
+                    <div className="bg-slate-800/80 border border-slate-700 rounded-2xl p-4 space-y-2">
+                      <div className="text-xs font-bold text-slate-300">🕒 本機剛掃碼報到紀錄（最近 {recentScans.length} 筆）：</div>
+                      <div className="divide-y divide-slate-700/60 text-xs">
+                        {recentScans.map(item => (
+                          <div key={item.memberId} className="py-2 flex items-center justify-between">
+                            <div>
+                              <span className="font-bold text-white text-sm">{item.name}</span>
+                              <span className="ml-2 text-amber-300 font-mono">({item.gender} / {item.code})</span>
+                              <span className="ml-2 text-emerald-300">{item.unit} {item.region}</span>
+                            </div>
+                            <span className="font-mono text-slate-400">{item.timeStr}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ========================================== */}
+              {/* 分頁 2：依【單位 + 區域】選擇名單 */}
+              {/* ========================================== */}
+              {checkinTab === "zone" && (
+                <div className="space-y-5">
+                  <div className="bg-slate-800/90 border border-slate-700 rounded-2xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <label className="text-sm font-bold text-white">步驟 1：請選擇【單位】</label>
+                      {checkinUnit && <span className="text-xs text-emerald-400 font-semibold">已選：{checkinUnit}</span>}
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                      {stats.units.map(u => {
+                        const isSelected = checkinUnit === u.name;
+                        return (
+                          <button
+                            key={u.name}
+                            type="button"
+                            onClick={() => {
+                              setCheckinUnit(u.name);
+                              setCheckinRegion("");
+                            }}
+                            className={`p-3 rounded-xl border text-left transition ${
+                              isSelected
+                                ? "bg-emerald-950/90 border-emerald-400 ring-2 ring-emerald-500/40 text-white"
+                                : "bg-slate-900/80 border-slate-700 text-slate-200 hover:border-slate-500"
+                            }`}
+                          >
+                            <div className="font-bold text-sm truncate">{u.name}</div>
+                            <div className="text-[11px] text-slate-400 mt-1">實到 {u.present} / 應到 {u.total}</div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {checkinUnit && (
+                    <div className="bg-slate-800/90 border border-slate-700 rounded-2xl p-4 space-y-3">
+                      <div className="flex items-center justify-between">
+                        <label className="text-sm font-bold text-white">步驟 2：請選擇【{checkinUnit}】所屬【區域】</label>
+                        {checkinRegion && <span className="text-xs text-sky-400 font-semibold">已選：{checkinRegion}</span>}
+                      </div>
+                      <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2.5">
+                        {checkinRegionsForUnit.map(r => {
+                          const isSelected = checkinRegion === r.name;
+                          const absent = r.total - r.present - r.leave;
+                          return (
+                            <button
+                              key={r.name}
+                              type="button"
+                              onClick={() => setCheckinRegion(r.name)}
+                              className={`p-2.5 rounded-xl border text-left transition ${
+                                isSelected
+                                  ? "bg-indigo-950/90 border-indigo-400 ring-2 ring-indigo-500/40 text-white"
+                                  : absent === 0
+                                  ? "bg-emerald-950/30 border-emerald-700/50 text-emerald-200"
+                                  : "bg-slate-900/80 border-slate-700 text-slate-200 hover:border-slate-500"
+                              }`}
+                            >
+                              <div className="font-bold text-sm font-mono">{r.name}</div>
+                              <div className="text-[11px] text-slate-400 mt-0.5">到 {r.present}/{r.total}</div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {checkinUnit && checkinRegion && (
+                    <div className="bg-slate-800/90 border border-slate-700 rounded-2xl p-4 space-y-4">
+                      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-700 pb-3">
+                        <div>
+                          <h3 className="text-base font-extrabold text-white">
+                            📋 【{checkinUnit} - {checkinRegion}】點名清冊（共 {checkinZoneMembers.length} 人）
+                          </h3>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                            點選「請假」可選擇【事假、病假、公假、晚到、自行填寫】；已登記狀態若需異動請點「🔒 修改狀態」。
+                          </p>
+                        </div>
+
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <button
+                            type="button"
+                            onClick={() => selectAllAbsentInZone(checkinZoneMembers)}
+                            className="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs text-emerald-300 font-semibold transition"
+                          >
+                            ☑ 本區未到者全選簽到
+                          </button>
+                          {draftEntries.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setDraftBatch({})}
+                              className="px-2.5 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs text-rose-300 transition"
+                            >
+                              清除預選 ({draftEntries.length})
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      <input
+                        type="text"
+                        value={checkinSearchFilter}
+                        onChange={e => setCheckinSearchFilter(e.target.value)}
+                        placeholder="在此區域內快速過濾求道名或編號..."
+                        className="w-full px-3.5 py-2 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500"
+                      />
+
+                      <div className="divide-y divide-slate-700/70">
+                        {checkinZoneMembers.map(person => {
+                          const c = checkins[person.memberId];
+                          const draftItem = draftBatch[person.memberId];
+                          const isM = isMaleGender(person.gender);
+
+                          return (
+                            <div
+                              key={person.memberId}
+                              className={`py-3 px-2 flex flex-wrap items-center justify-between gap-3 rounded-lg transition ${
+                                draftItem?.status === "present"
+                                  ? "bg-emerald-950/40"
+                                  : draftItem?.status === "leave"
+                                  ? "bg-amber-950/40"
+                                  : ""
+                              }`}
+                            >
+                              <div className="flex items-center gap-3">
+                                <span className={`text-xs font-bold px-2 py-1 rounded ${
+                                  isM ? "bg-sky-500/20 text-sky-300" : "bg-pink-500/20 text-pink-300"
+                                }`}>
+                                  {person.gender}
+                                </span>
+                                <div>
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-bold text-base text-white">{person.name}</span>
+                                    <span className="text-xs font-mono text-amber-300 bg-slate-900 px-1.5 py-0.5 rounded border border-slate-700">
+                                      編號 {person.code}
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 flex items-center gap-2 flex-wrap">
+                                    {renderStatusBadge(c)}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <div>{renderMemberActionButtons(person, true)}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* ========================================== */}
+              {/* 分頁 3：跨區個人關鍵字搜尋 */}
+              {/* ========================================== */}
+              {checkinTab === "search" && (
+                <div className="bg-slate-800/90 border border-slate-700 rounded-2xl p-5 space-y-4">
+                  <div>
+                    <h3 className="text-base font-bold text-white">🔍 搜尋個人編號或求道名</h3>
+                    <p className="text-xs text-slate-400 mt-0.5">輸入求道名或編號，點選「簽到」或「請假」即可完成登記。</p>
+                  </div>
+
+                  <input
+                    type="text"
+                    value={queryInput}
+                    onChange={e => setQueryInput(e.target.value)}
+                    placeholder="請輸入編號或求道名..."
+                    className="w-full px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 text-white text-base focus:outline-none focus:border-indigo-500"
+                  />
+
+                  {searchMatches.length > 0 && (
+                    <div className="divide-y divide-slate-700/70 bg-slate-900/70 rounded-xl border border-slate-700 p-2">
+                      {searchMatches.map(person => {
+                        const c = checkins[person.memberId];
+                        return (
+                          <div key={person.memberId} className="p-3 flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                              <div className="font-bold text-base text-white flex items-center gap-2">
+                                <span>{person.name}</span>
+                                <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-slate-800 text-amber-300">
+                                  編號 {person.code}
+                                </span>
+                                <span className="text-xs text-slate-400">({person.gender})</span>
+                              </div>
+                              <div className="text-xs text-slate-400 mt-1 flex items-center gap-2 flex-wrap">
+                                <span>
+                                  <b className="text-emerald-300">{person.unit}</b> ／ <b className="text-sky-300">{person.region}</b>
+                                </span>
+                                {renderStatusBadge(c)}
+                              </div>
+                            </div>
+                            <div>{renderMemberActionButtons(person, false)}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </main>
+          )}
+
+          {/* 底部浮動確認列 */}
+          {draftEntries.length > 0 && (
+            <div className="fixed bottom-0 inset-x-0 z-40 bg-slate-950/95 border-t-2 border-emerald-500 px-4 py-3 shadow-2xl">
+              <div className="max-w-4xl mx-auto flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <span className="px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 font-bold text-xs border border-emerald-500/40">
+                    已預選 {draftEntries.length} 人
+                  </span>
+                  <span className="text-xs text-slate-300">
+                    （簽到 <b>{draftPresentCount}</b> 人 ／ 請假或晚到 <b>{draftLeaveCount}</b> 人）
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={() => setDraftBatch({})} className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-300">取消預選</button>
+                  <button
+                    type="button"
+                    onClick={() => setBatchConfirmModalOpen(true)}
+                    className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-extrabold text-sm shadow-lg shadow-emerald-500/30 transition"
+                  >
+                    ✅ 確認送出本批點名 ({draftEntries.length}人)
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
